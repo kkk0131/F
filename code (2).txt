@@ -1,0 +1,156 @@
+clear; clc;
+
+% ===================== 系統參數設定 =====================
+M = 4; % PSK M值 (4-PSK)
+N = 128; % RIS元素數量
+L = 2; % 需要選擇的接收天線數量
+K = 8; % 可選的接收天線數量
+Eb_N0_dB = -10:1:-3; % 定義 Eb/N0 範圍 (dB)
+
+% ===================== 索引調製參數 =====================
+IM_bits = floor(log2(nchoosek(K, L))); % 索引調製比特數
+PSK_bits = L * log2(M); % PSK符號比特數
+B = IM_bits + PSK_bits; % 總比特數
+
+
+% ===================== 天線組合與 Gray Code 映射 =====================
+antenna_set = nchoosek(1:K, L);
+valid_combinations = 2^IM_bits;
+antenna_set = antenna_set(1:valid_combinations, :);
+
+% Gray Code 編碼
+decimal_numbers = 0:(valid_combinations - 1);
+gray_numbers = bitxor(decimal_numbers, bitshift(decimal_numbers, -1));
+codewords = de2bi(gray_numbers, IM_bits, 'left-msb');
+
+% 建立天線組合與 Gray Code 的映射
+antenna_map = containers.Map(cellfun(@mat2str, num2cell(antenna_set, 2), 'UniformOutput', false), ...
+cellfun(@mat2str, num2cell(codewords, 2), 'UniformOutput', false));
+
+% 定義 Gray Code 和 PSK 符號集
+gray_code = [0, 1, 3, 2];
+PSK_symbols = exp(1j * (2 * pi * (0:M-1) / M));
+PSK_symbols_gray = PSK_symbols(gray_code + 1);
+
+% 生成所有可能的 PSK 符號組合
+[X1, X2] = ndgrid(PSK_symbols_gray, PSK_symbols_gray);
+PSK_combinations = [X1(:), X2(:)].';
+
+% ===================== 初始化 BER =====================
+BER = zeros(length(Eb_N0_dB), 1);
+
+% ===================== 主仿真循環 =====================
+for idx = 1:length(Eb_N0_dB)
+    disp(['Processing Eb/N0 = ', num2str(Eb_N0_dB(idx)), ' dB...']);
+    % 將 Eb/N0 轉換為 Es/N0
+    Es_N0_dB = Eb_N0_dB - 10 * log10(N * K) + 10 * log10(B);
+    Es_N0 = 10.^(Es_N0_dB / 10); % 線性值
+    Es=Es_N0(idx)
+    sigma_square = 1;
+    err_count = 0;
+    bit_count = 0;
+
+    while err_count < 1000
+        % ===================== 傳輸端 =====================
+        % 隨機生成 IM 比特並映射到天線組合
+        im_bits = randi([0, 1], 1, IM_bits)
+        codeword_str = mat2str(im_bits)
+        antenna_idx = find(cellfun(@(x) strcmp(x, codeword_str), values(antenna_map)))
+        transmit_antenna_idx = antenna_set(antenna_idx, :)
+        [transmit_antenna_idx, sort_idx] = sort(transmit_antenna_idx)
+
+        % 選擇 PSK 符號並同步排序
+        transmitted_symbols = PSK_combinations(:, randi(size(PSK_combinations, 2)))
+        transmitted_symbols = transmitted_symbols(sort_idx)
+
+        % 隨機生成信道
+        H = sqrt(1/2) * (randn(K, N) + 1j * randn(K, N));
+
+        % RIS 相位最佳化
+        theta = zeros(N, 1);
+        lambda_l = ones(L, 1) * (1 / L);
+        for i = 1:N
+           numerator = sum(lambda_l .* transmitted_symbols .* conj(H(transmit_antenna_idx, i)));
+           demerator = sum(lambda_l .* conj(transmitted_symbols) .* H(transmit_antenna_idx, i));
+           theta(i) = numerator / abs(demerator);
+        end
+
+        % 接收信號建模
+        y = zeros(K, 1);
+        for k = 1:K
+            h_k = H(k, :);
+            noise = sqrt(1 / 2) * (randn + 1j * randn); % 確保變異數為 1
+            % disp(size(h_k));  % 應該是 [1, N]
+            % disp(size(theta)); % 應該是 [N, 1]
+            y(k) = sqrt(Es) * (h_k * theta) + noise
+        end
+
+        % ===================== ML 解碼 =====================
+        min_distance = Inf;
+        for s_idx = 1:size(antenna_set, 1)
+            current_antenna_set = antenna_set(s_idx, :);
+            for x_idx = 1:size(PSK_combinations, 2)
+                current_symbols = PSK_combinations(:, x_idx);
+
+                % 計算最佳化 RIS 相位
+                theta_opt = zeros(N, 1);
+                lambda_l = ones(L, 1) * (1 / L);
+                for i = 1:N
+                    54
+                    
+                    numerator = sum(lambda_l .* current_symbols .* conj(H(current_antenna_set, i)));
+                    demerator = sum(lambda_l .* conj(current_symbols) .* H(current_antenna_set, i));
+                    theta_opt(i) = numerator / abs(demerator);
+                end
+
+                % 預測信號
+                predicted_signal = zeros(K, 1);
+                for k = 1:K
+                    predicted_signal(k) = sqrt(Es) * (H(k, :) * theta_opt);
+                end
+
+                % 計算歐幾里得距離
+                distance = sum(abs(y - predicted_signal).^2);
+                if distance < min_distance
+                    min_distance = distance;
+                    best_set = current_antenna_set
+                    best_symbols = current_symbols
+                end
+            end
+        end
+
+        % ===================== 比特錯誤比較 =====================
+        % 解碼 IM 比特
+        best_set_str = mat2str(sort(best_set));
+        estimated_im_bits = str2num(antenna_map(best_set_str));
+
+        % 解碼 PSK 符號比特
+        estimated_bits = estimated_im_bits;
+        for l = 1:L
+            [~, symbol_idx] = min(abs(PSK_symbols_gray - best_symbols(l)));
+            estimated_bits = [estimated_bits, de2bi(symbol_idx - 1, log2(M), 'left-msb')];
+        end
+
+        % 計算錯誤
+        transmitted_bits = [im_bits];
+        for l = 1:L
+            symbol_bits = de2bi(find(PSK_symbols_gray == transmitted_symbols(l)) - 1, log2(M), 'left-msb');
+            transmitted_bits = [transmitted_bits, symbol_bits];
+        end
+
+        err_count = err_count + sum(transmitted_bits ~= estimated_bits);
+        bit_count = bit_count + numel(transmitted_bits);
+    end
+
+    BER(idx) = err_count / bit_count
+   Eb_N0_dB(idx)
+end
+
+% ===================== 繪圖 =====================
+figure;
+semilogy(Eb_N0_dB, BER, '-o', 'LineWidth', 2);
+grid on;
+xlabel('E_b/N_0 (dB)');
+ylabel('Bit Error Rate (BER)');
+title('BER vs E_b/N_0 for RIS-RGSM (ML)');
+legend;
